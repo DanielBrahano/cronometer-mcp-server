@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { Env, Variables } from "./types.js";
 import { createMcpRoutes } from "./routes/mcp.js";
 import utilityRoutes from "./routes/utility.js";
+import oauthRoutes from "./routes/oauth.js";
 import { mcpHandlers } from "./mcp-handlers.js";
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -32,7 +33,8 @@ app.onError((err, c) => {
 	return c.json({ error: "internal_server_error", message: "An unexpected error occurred" }, 500);
 });
 
-// Mount routes (MCP first — it owns /mcp and /sse with bearer auth)
+// Mount routes (OAuth before MCP so metadata endpoints are unauthenticated)
+app.route("/", oauthRoutes);
 app.route("/", createMcpRoutes(mcpHandlers));
 app.route("/", utilityRoutes);
 
