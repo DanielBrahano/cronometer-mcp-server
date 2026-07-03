@@ -302,6 +302,7 @@ export class CronometerClient {
 		mealGroup: number;
 		translationId?: number;
 	}): Promise<any> {
+		await this.ensureAuth(); // must run before building serving so this.userId is populated
 		const serving = {
 			order: (entry.mealGroup << 16) | 1,
 			day: entry.day,
