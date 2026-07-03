@@ -28,15 +28,18 @@ function macroLine(m: Macros): string {
 	return `${m.calories} kcal · P ${m.protein}g · C ${m.carbs}g · F ${m.fat}g`;
 }
 
-export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
+type AgentState = {
+	session: CronometerSession | null;
+};
+
+export class MyMCP extends McpAgent<Env, AgentState, Props> {
 	server = new McpServer({
 		name: "Cronometer",
 		version: "1.0.0",
 		title: "Cronometer Nutrition",
 	});
 
-	/** Cached session, reused across tool calls within this agent instance. */
-	private session: CronometerSession | null = null;
+	initialState: AgentState = { session: null };
 
 	/** Build a client from the configured credentials, reusing any cached session. */
 	private getClient(): CronometerClient {
@@ -50,9 +53,9 @@ export class MyMCP extends McpAgent<Env, Record<string, never>, Props> {
 		return new CronometerClient({
 			email,
 			password,
-			session: this.session,
+			session: this.state.session,
 			onSession: (s) => {
-				this.session = s;
+				this.setState({ session: s });
 			},
 		});
 	}
