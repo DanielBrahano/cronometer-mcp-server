@@ -41,8 +41,39 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 
 	initialState: AgentState = { session: null };
 
-	/** Build a client from the configured credentials, reusing any cached session. */
-	private getClient(): CronometerClient {
+	private getSessionStub() {
+		return this.env.SESSION_STORE.get(
+			this.env.SESSION_STORE.idFromName("default"),
+		);
+	}
+
+	private async getSharedSession(): Promise<CronometerSession | null> {
+		try {
+			const res = await this.getSessionStub().fetch("http://internal/get");
+			if (!res.ok) return null;
+			return (await res.json()) as CronometerSession | null;
+		} catch {
+			return null;
+		}
+	}
+
+	private saveSharedSession(session: CronometerSession): void {
+		this.getSessionStub()
+			.fetch("http://internal/set", {
+				method: "POST",
+				body: JSON.stringify(session),
+			})
+			.catch((err) => console.error("SessionStore write failed:", err));
+	}
+
+	/**
+	 * Build a Cronometer client, reusing any cached session.
+	 *
+	 * Fast path (same MCP session): reads from this DO's SQLite state (no network).
+	 * Cross-session path (new conversation): falls back to the SessionStore DO so
+	 * we don't need a fresh Cronometer login on every new claude.ai conversation.
+	 */
+	private async getClient(): Promise<CronometerClient> {
 		const email = this.env.CRONOMETER_EMAIL;
 		const password = this.env.CRONOMETER_PASSWORD;
 		if (!email || !password) {
@@ -50,12 +81,26 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 				"Cronometer credentials are not configured. Set the CRONOMETER_EMAIL and CRONOMETER_PASSWORD secrets with `wrangler secret put`.",
 			);
 		}
+
+		// Use this DO's persisted state (fast, no network hop).
+		let session = this.state.session;
+
+		// On a brand-new MCP session (state is empty), try the shared singleton store.
+		if (!session) {
+			session = await this.getSharedSession();
+			if (session) {
+				// Cache locally so subsequent calls in this session skip the network hop.
+				this.setState({ session });
+			}
+		}
+
 		return new CronometerClient({
 			email,
 			password,
-			session: this.state.session,
+			session,
 			onSession: (s) => {
-				this.setState({ session: s });
+				this.setState({ session: s });   // sync: local SQLite
+				this.saveSharedSession(s);        // async fire-and-forget: shared store
 			},
 		});
 	}
@@ -78,7 +123,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 					validateDate(d, "date");
 					const cronoDay = toCronoDay(d);
 
-					const client = this.getClient();
+					const client = await this.getClient();
 					const diaryRaw = await client.getDiary(cronoDay);
 
 					const entries = parseDiary(diaryRaw);
@@ -158,7 +203,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 					validateDate(end_date, "end_date");
 
 					const dates = enumerateDates(start_date, end_date, 31);
-					const client = this.getClient();
+					const client = await this.getClient();
 
 					const daily: Array<{ date: string } & Macros> = [];
 					for (const d of dates) {
@@ -197,7 +242,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool("get_goals", {}, async () => {
 			try {
-				const client = this.getClient();
+				const client = await this.getClient();
 				const diaryRaw = await client.getDiary(toCronoDay(todayDate()));
 				const { goals, raw } = parseGoals(diaryRaw);
 
@@ -230,7 +275,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 				try {
 					const d = date ?? todayDate();
 					validateDate(d, "date");
-					const client = this.getClient();
+					const client = await this.getClient();
 					const raw = await client.getNutritionScores(toCronoDay(d));
 
 					return {
@@ -269,7 +314,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 			},
 			async ({ query, max_results }) => {
 				try {
-					const client = this.getClient();
+					const client = await this.getClient();
 					const raw = await client.searchFood(query);
 					const results = parseFoodSearch(raw).slice(0, max_results);
 
@@ -333,7 +378,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 					const d = date ?? todayDate();
 					validateDate(d, "date");
 
-					const client = this.getClient();
+					const client = await this.getClient();
 
 					let resolvedMeasureId = measure_id;
 					if (resolvedMeasureId == null) {
@@ -389,7 +434,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 				try {
 					const d = date ?? todayDate();
 					validateDate(d, "date");
-					const client = this.getClient();
+					const client = await this.getClient();
 					const count = await client.deleteServings(toCronoDay(d), serving_ids);
 					return {
 						content: [
@@ -447,7 +492,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 							],
 						};
 					}
-					const client = this.getClient();
+					const client = await this.getClient();
 					const mealGroup =
 						meal_name != null ? MEAL_GROUPS[meal_name as MealName] : undefined;
 					const raw = await client.updateServing({
@@ -503,7 +548,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 					validateDate(fromD, "from_date");
 					validateDate(toD, "to_date");
 
-					const client = this.getClient();
+					const client = await this.getClient();
 					const raw = await client.copyDay(toCronoDay(fromD), toCronoDay(toD));
 
 					return {
@@ -541,7 +586,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 				try {
 					const d = date ?? todayDate();
 					validateDate(d, "date");
-					const client = this.getClient();
+					const client = await this.getClient();
 					const raw = await client.setDayComplete(toCronoDay(d), complete ?? true);
 					const status = (complete ?? true) ? "complete" : "incomplete";
 					return {
@@ -610,7 +655,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 				serving_grams,
 			}) => {
 				try {
-					const client = this.getClient();
+					const client = await this.getClient();
 					const result = await client.createCustomFood({
 						name,
 						calories,
@@ -666,7 +711,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 					validateDate(start, "start_date");
 					validateDate(end, "end_date");
 
-					const client = this.getClient();
+					const client = await this.getClient();
 					const raw = await client.getFastingHistory(toCronoDay(start), toCronoDay(end));
 
 					return {
@@ -686,7 +731,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool("get_fasting_stats", {}, async () => {
 			try {
-				const client = this.getClient();
+				const client = await this.getClient();
 				const raw = await client.getFastingStats();
 
 				return {
