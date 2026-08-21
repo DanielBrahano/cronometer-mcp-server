@@ -28,6 +28,111 @@ const APP_BUILD = "4.48.2 b2807-a";
 const APP_DEVICE = "Android 14 (SDK 34), Google Pixel 6 Pro";
 const USER_AGENT = "Dart/3.9 (dart:io)";
 
+/** Abort an upstream call that has not responded within this many ms. */
+const REQUEST_TIMEOUT_MS = 15_000;
+
+/** Retry attempts after the initial try, for transient failures only. */
+const MAX_RETRIES = 3;
+
+/** Base for exponential backoff: 300ms, 600ms, 1200ms (plus jitter). */
+const BASE_BACKOFF_MS = 300;
+
+/** Never wait longer than this between attempts, whatever Retry-After says. */
+const MAX_BACKOFF_MS = 5_000;
+
+/**
+ * v2 endpoints that only read. Everything on the mobile API is a POST, so the
+ * HTTP method says nothing about whether replaying is safe — retrying
+ * add_serving would double-log a food. Only endpoints listed here are retried
+ * after a 5xx; writes fail fast and let the caller decide.
+ */
+const READ_ONLY_ENDPOINTS = new Set([
+	"/api/v2/find_food",
+	"/api/v2/get_food",
+	"/api/v2/get_diary",
+	"/api/v2/get_nutrition_scores",
+	"/api/v2/get_fasting_with_date_range",
+	"/api/v2/get_fasting_stats",
+]);
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 429 is always safe to retry — a rate-limited request was rejected before it
+ * was processed. 5xx is only safe when the endpoint does not mutate anything.
+ */
+function isRetryable(status: number, replayable: boolean): boolean {
+	if (status === 429) return true;
+	if (!replayable) return false;
+	return status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+/** Honour Retry-After when present, else exponential backoff with jitter. */
+function retryDelayMs(res: Response | null, attempt: number): number {
+	const header = res?.headers.get("Retry-After");
+	if (header) {
+		const seconds = Number(header);
+		if (Number.isFinite(seconds)) {
+			return Math.min(seconds * 1000, MAX_BACKOFF_MS);
+		}
+		const date = Date.parse(header);
+		if (!Number.isNaN(date)) {
+			return Math.min(Math.max(date - Date.now(), 0), MAX_BACKOFF_MS);
+		}
+	}
+	return Math.min(
+		BASE_BACKOFF_MS * 2 ** attempt + Math.random() * BASE_BACKOFF_MS,
+		MAX_BACKOFF_MS,
+	);
+}
+
+/**
+ * fetch with a hard timeout, retrying transient failures.
+ *
+ * Without the timeout a hung Cronometer call would hold the Worker request open
+ * until the platform killed it, which surfaces to the user as a dead tool rather
+ * than an error they can act on.
+ */
+async function fetchWithRetry(
+	url: string,
+	init: RequestInit,
+	replayable: boolean,
+	label: string,
+): Promise<Response> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			const res = await fetch(url, {
+				...init,
+				signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+			});
+
+			if (attempt < MAX_RETRIES && isRetryable(res.status, replayable)) {
+				await sleep(retryDelayMs(res, attempt));
+				continue;
+			}
+
+			return res;
+		} catch (error) {
+			// No response was received, so replaying is safe where the endpoint allows it.
+			if (replayable && attempt < MAX_RETRIES) {
+				await sleep(retryDelayMs(null, attempt));
+				continue;
+			}
+
+			const timedOut = error instanceof Error && error.name === "TimeoutError";
+			throw new CronometerApiError(
+				timedOut
+					? `Cronometer ${label} timed out after ${REQUEST_TIMEOUT_MS}ms`
+					: `Could not reach Cronometer (${label}): ${error instanceof Error ? error.message : "network error"}`,
+				504,
+				{ attempts: attempt + 1 },
+			);
+		}
+	}
+}
+
 /** Canonical Cronometer nutrient IDs (per-100g basis). */
 export const NUTRIENT_IDS = {
 	energy: 208,
@@ -128,15 +233,20 @@ export class CronometerClient {
 			config: { call_version: 2 },
 		};
 
-		const res = await fetch(`${this.baseUrl}/api/v2/login`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "text/plain; charset=utf-8",
-				"User-Agent": USER_AGENT,
-				Accept: "application/json",
+		const res = await fetchWithRetry(
+			`${this.baseUrl}/api/v2/login`,
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "text/plain; charset=utf-8",
+					"User-Agent": USER_AGENT,
+					Accept: "application/json",
+				},
+				body: JSON.stringify(payload),
 			},
-			body: JSON.stringify(payload),
-		});
+			true, // minting a session twice is harmless
+			"login",
+		);
 
 		const data = await this.parseBody(res);
 
@@ -213,15 +323,20 @@ export class CronometerClient {
 
 		const body = { ...payload, auth: this.authBlock(), lastSeen: 0 };
 
-		const res = await fetch(`${this.baseUrl}${endpoint}`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "text/plain; charset=utf-8",
-				"User-Agent": USER_AGENT,
-				Accept: "application/json",
+		const res = await fetchWithRetry(
+			`${this.baseUrl}${endpoint}`,
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": "text/plain; charset=utf-8",
+					"User-Agent": USER_AGENT,
+					Accept: "application/json",
+				},
+				body: JSON.stringify(body),
 			},
-			body: JSON.stringify(body),
-		});
+			READ_ONLY_ENDPOINTS.has(endpoint),
+			endpoint,
+		);
 
 		if ((res.status === 401 || res.status === 403) && !isRetry) {
 			await this.ensureAuth(true);
@@ -380,7 +495,7 @@ export class CronometerClient {
 			return 0;
 		}
 
-		const res = await fetch(
+		const res = await fetchWithRetry(
 			`${this.baseUrl}/api/v3/user/${this.userId}/diary-entries`,
 			{
 				method: "DELETE",
@@ -394,6 +509,8 @@ export class CronometerClient {
 				},
 				body: JSON.stringify({ diaryEntries: toDelete }),
 			},
+			false, // a replayed delete can 404 on the second pass — fail fast instead
+			"delete diary entries",
 		);
 
 		if (res.status !== 204 && !res.ok) {

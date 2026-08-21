@@ -1,11 +1,18 @@
 import { Hono } from "hono";
 import type { Env, Variables } from "../types.js";
 import { CronometerClient } from "../lib/client.js";
+import { TOOL_CATALOG, TOOL_COUNT, TOOL_NAMES } from "../lib/tool-catalog.js";
 
 const utilityRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
 
-// Health check — reports whether credentials are configured and (optionally)
-// whether a live login succeeds when ?verify=1 is passed.
+/**
+ * Health check.
+ *
+ * Reports whether credentials are configured, the tool manifest, and — with
+ * ?verify=1 — whether a live Cronometer login succeeds. Tool names come from the
+ * same TOOL_CATALOG that mcp-agent.ts registers from, so this cannot drift from
+ * what the Durable Object actually exposes. Pass ?verbose=1 for descriptions.
+ */
 utilityRoutes.get("/health", async (c) => {
 	const hasCreds = !!(c.env.CRONOMETER_EMAIL && c.env.CRONOMETER_PASSWORD);
 	let loginOk: boolean | undefined;
@@ -31,6 +38,9 @@ utilityRoutes.get("/health", async (c) => {
 		version: "1.0.0",
 		auth: "static-bearer",
 		credentials_configured: hasCreds,
+		tool_count: TOOL_COUNT,
+		tools: TOOL_NAMES,
+		...(c.req.query("verbose") === "1" ? { tool_descriptions: TOOL_CATALOG } : {}),
 		...(loginOk !== undefined ? { login_ok: loginOk } : {}),
 		...(loginError ? { login_error: loginError } : {}),
 	});

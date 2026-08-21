@@ -6,6 +6,7 @@ import {
 	type CronometerSession,
 } from "./lib/client.js";
 import { handleError } from "./lib/errors.js";
+import { TOOL_CATALOG } from "./lib/tool-catalog.js";
 import {
 	type Macros,
 	averageMacros,
@@ -58,12 +59,18 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 	}
 
 	private saveSharedSession(session: CronometerSession): void {
-		this.getSessionStub()
+		const write = this.getSessionStub()
 			.fetch("http://internal/set", {
 				method: "POST",
 				body: JSON.stringify(session),
 			})
 			.catch((err) => console.error("SessionStore write failed:", err));
+
+		// Hold the request open until the write lands. Fire-and-forget alone is
+		// not enough: the runtime can cancel an in-flight subrequest as soon as
+		// the tool call returns, so the shared session would silently fail to
+		// persist and the next conversation would pay for a fresh login.
+		this.ctx.waitUntil(write);
 	}
 
 	/**
@@ -111,6 +118,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool(
 			"get_nutrition_diary",
+			TOOL_CATALOG.get_nutrition_diary,
 			{
 				date: z
 					.string()
@@ -193,6 +201,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool(
 			"get_nutrition_summary",
+			TOOL_CATALOG.get_nutrition_summary,
 			{
 				start_date: z.string().describe("Start date (YYYY-MM-DD), inclusive."),
 				end_date: z.string().describe("End date (YYYY-MM-DD), inclusive."),
@@ -240,7 +249,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		// READ — GOALS (macro targets)
 		// ============================================
-		this.server.tool("get_goals", {}, async () => {
+		this.server.tool("get_goals", TOOL_CATALOG.get_goals, {}, async () => {
 			try {
 				const client = await this.getClient();
 				const diaryRaw = await client.getDiary(toCronoDay(todayDate()));
@@ -265,6 +274,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool(
 			"get_nutrition_scores",
+			TOOL_CATALOG.get_nutrition_scores,
 			{
 				date: z
 					.string()
@@ -301,6 +311,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool(
 			"search_food",
+			TOOL_CATALOG.search_food,
 			{
 				query: z.string().describe("Food to search for, e.g. 'chicken breast'."),
 				max_results: z
@@ -349,6 +360,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool(
 			"log_food",
+			TOOL_CATALOG.log_food,
 			{
 				meal_name: z
 					.enum(["breakfast", "lunch", "dinner", "snacks"])
@@ -418,6 +430,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool(
 			"delete_food",
+			TOOL_CATALOG.delete_food,
 			{
 				serving_ids: z
 					.array(z.union([z.string(), z.number()]))
@@ -458,6 +471,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool(
 			"update_food",
+			TOOL_CATALOG.update_food,
 			{
 				serving_id: z
 					.union([z.string(), z.number()])
@@ -524,6 +538,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool(
 			"copy_day",
+			TOOL_CATALOG.copy_day,
 			{
 				from_date: z
 					.string()
@@ -571,6 +586,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool(
 			"mark_day_complete",
+			TOOL_CATALOG.mark_day_complete,
 			{
 				date: z
 					.string()
@@ -606,6 +622,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool(
 			"create_custom_food",
+			TOOL_CATALOG.create_custom_food,
 			{
 				name: z.string().describe("Food name (e.g. 'My Protein Bar')."),
 				calories: z.number().nonnegative().describe("Calories per serving."),
@@ -690,6 +707,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		this.server.tool(
 			"get_fasting_history",
+			TOOL_CATALOG.get_fasting_history,
 			{
 				start_date: z
 					.string()
@@ -729,7 +747,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		// READ — FASTING STATS
 		// ============================================
-		this.server.tool("get_fasting_stats", {}, async () => {
+		this.server.tool("get_fasting_stats", TOOL_CATALOG.get_fasting_stats, {}, async () => {
 			try {
 				const client = await this.getClient();
 				const raw = await client.getFastingStats();
