@@ -6,19 +6,26 @@ import {
 	type CronometerSession,
 } from "./lib/client.js";
 import { handleError } from "./lib/errors.js";
+import { readSharedSession, writeSharedSession } from "./lib/session-cache.js";
 import { TOOL_CATALOG } from "./lib/tool-catalog.js";
 import {
+	type FoodNutrients,
 	type Macros,
 	averageMacros,
 	enumerateDates,
 	MEAL_GROUPS,
 	MEAL_NAMES,
 	type MealName,
+	measureGramsFromFood,
 	nowTime,
+	nutrientsToMacros,
 	parseConsumed,
 	parseDiary,
+	parseFoodNutrients,
 	parseFoodSearch,
 	parseGoals,
+	roundMacros,
+	scaleNutrients,
 	toCronoDay,
 	todayDate,
 	validateDate,
@@ -42,35 +49,12 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 
 	initialState: AgentState = { session: null };
 
-	private getSessionStub() {
-		return this.env.SESSION_STORE.get(
-			this.env.SESSION_STORE.idFromName("default"),
-		);
-	}
-
-	private async getSharedSession(): Promise<CronometerSession | null> {
-		try {
-			const res = await this.getSessionStub().fetch("http://internal/get");
-			if (!res.ok) return null;
-			return (await res.json()) as CronometerSession | null;
-		} catch {
-			return null;
-		}
-	}
-
 	private saveSharedSession(session: CronometerSession): void {
-		const write = this.getSessionStub()
-			.fetch("http://internal/set", {
-				method: "POST",
-				body: JSON.stringify(session),
-			})
-			.catch((err) => console.error("SessionStore write failed:", err));
-
 		// Hold the request open until the write lands. Fire-and-forget alone is
 		// not enough: the runtime can cancel an in-flight subrequest as soon as
 		// the tool call returns, so the shared session would silently fail to
 		// persist and the next conversation would pay for a fresh login.
-		this.ctx.waitUntil(write);
+		this.ctx.waitUntil(writeSharedSession(this.env, session));
 	}
 
 	/**
@@ -94,7 +78,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 
 		// On a brand-new MCP session (state is empty), try the shared singleton store.
 		if (!session) {
-			session = await this.getSharedSession();
+			session = await readSharedSession(this.env);
 			if (session) {
 				// Cache locally so subsequent calls in this session skip the network hop.
 				this.setState({ session });
@@ -137,8 +121,11 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 					const entries = parseDiary(diaryRaw);
 					const totals = parseConsumed(diaryRaw);
 
-					// Resolve real food names via get_food for each unique foodId.
+					// Diary entries carry only foodId/grams, so names *and* nutrients both
+					// come from get_food. One lookup per unique food serves both, which is
+					// why adding per-item macros costs no extra API calls.
 					const nameById = new Map<number, string>();
+					const nutrientsById = new Map<number, FoodNutrients>();
 					const uniqueIds = [
 						...new Set(
 							entries
@@ -151,39 +138,112 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 							try {
 								const food = await client.getFood(id);
 								if (food?.name) nameById.set(id, String(food.name));
+								const nutrients = parseFoodNutrients(food);
+								if (nutrients) nutrientsById.set(id, nutrients);
 							} catch {
-								/* leave unresolved — falls back to the parsed name */
+								/* leave unresolved — falls back to the parsed name, no macros */
 							}
 						}),
 					);
 
+					// Per-entry macros, scaled from the food's per-100g figures to the
+					// grams actually logged. Left undefined when the food could not be
+					// resolved, so a lookup failure never reports zeroes as real values.
+					const detailed = entries.map((e) => {
+						const macros =
+							e.foodId != null && e.grams != null
+								? (() => {
+										const n = nutrientsById.get(e.foodId);
+										return n ? scaleNutrients(n, e.grams) : undefined;
+									})()
+								: undefined;
+						return {
+							serving_id: e.servingId,
+							food_id: e.foodId,
+							name: (e.foodId != null && nameById.get(e.foodId)) || e.name,
+							meal:
+								e.mealGroup != null ? MEAL_NAMES[e.mealGroup] : undefined,
+							grams: e.grams,
+							measure_id: e.measureId,
+							kcal: macros?.calories,
+							protein_g: macros?.protein,
+							carbs_g: macros?.carbs,
+							fat_g: macros?.fat,
+						};
+					});
+
+					// Summing the per-item figures gives a cross-check against the totals
+					// Cronometer computed itself; a large gap means some foods did not resolve.
+					const perItemTotal = detailed.reduce(
+						(acc, e) => ({
+							calories: acc.calories + (e.kcal ?? 0),
+							protein: acc.protein + (e.protein_g ?? 0),
+							carbs: acc.carbs + (e.carbs_g ?? 0),
+							fat: acc.fat + (e.fat_g ?? 0),
+						}),
+						{ calories: 0, protein: 0, carbs: 0, fat: 0 },
+					);
+					const unresolved = detailed.filter((e) => e.kcal == null).length;
+
+					// Group by meal so the day reads in the order it was eaten.
+					const byMeal = new Map<string, typeof detailed>();
+					for (const e of detailed) {
+						const meal = e.meal ?? "other";
+						const bucket = byMeal.get(meal);
+						if (bucket) bucket.push(e);
+						else byMeal.set(meal, [e]);
+					}
+					const mealOrder = ["breakfast", "lunch", "dinner", "snacks", "other"];
+					const sortedMeals = [...byMeal.keys()].sort(
+						(a, b) => mealOrder.indexOf(a) - mealOrder.indexOf(b),
+					);
+
 					const list =
-						entries.length > 0
-							? entries
-									.map((e) => {
-										const name =
-											(e.foodId != null && nameById.get(e.foodId)) || e.name;
-										const grams = e.grams != null ? ` — ${e.grams} g` : "";
-										const meal =
-											e.mealGroup != null && MEAL_NAMES[e.mealGroup]
-												? ` [${MEAL_NAMES[e.mealGroup]}]`
-												: "";
-										const sid =
-											e.servingId != null
-												? ` [serving_id: ${e.servingId}]`
-												: "";
-										return `   - ${name}${grams}${meal}${sid}`;
+						detailed.length > 0
+							? sortedMeals
+									.map((meal) => {
+										const items = byMeal.get(meal) ?? [];
+										const mealTotal = items.reduce(
+											(acc, e) => ({
+												calories: acc.calories + (e.kcal ?? 0),
+												protein: acc.protein + (e.protein_g ?? 0),
+												carbs: acc.carbs + (e.carbs_g ?? 0),
+												fat: acc.fat + (e.fat_g ?? 0),
+											}),
+											{ calories: 0, protein: 0, carbs: 0, fat: 0 },
+										);
+										const lines = items.map((e) => {
+											const grams = e.grams != null ? ` — ${e.grams} g` : "";
+											const macros =
+												e.kcal != null
+													? ` · ${e.kcal} kcal · P ${e.protein_g}g · C ${e.carbs_g}g · F ${e.fat_g}g`
+													: " · (nutrition unavailable)";
+											const sid =
+												e.serving_id != null
+													? ` [serving_id: ${e.serving_id}]`
+													: "";
+											return `   - ${e.name}${grams}${macros}${sid}`;
+										});
+										return `${meal} — ${macroLine(roundMacros(mealTotal))}\n${lines.join("\n")}`;
 									})
-									.join("\n")
+									.join("\n\n")
 							: "No food logged for this date.";
 
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Nutrition diary for ${d}\nDaily totals: ${macroLine(totals)}`,
+								text: `Nutrition diary for ${d}\nDaily totals (from Cronometer): ${macroLine(totals)}\nSum of per-item values: ${macroLine(roundMacros(perItemTotal))}${
+									unresolved > 0
+										? `\nNote: ${unresolved} of ${detailed.length} entries could not be resolved, so the per-item sum is lower than the day's real total.`
+										: ""
+								}`,
 							},
 							{ type: "text", text: `Logged foods:\n${list}` },
+							{
+								type: "text",
+								text: `\n\nPer-item detail:\n${JSON.stringify(detailed, null, 2)}`,
+							},
 							{
 								type: "text",
 								text: `\n\nRaw diary:\n${JSON.stringify(diaryRaw, null, 2)}`,
@@ -322,12 +382,39 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 					.optional()
 					.default(5)
 					.describe("Maximum number of results (default 5, max 20)."),
+				include_nutrition: z
+					.boolean()
+					.optional()
+					.default(true)
+					.describe(
+						"Fetch per-100g calories and macros for each result (default true). Costs one extra API call per result; set false for a faster name-only lookup.",
+					),
 			},
-			async ({ query, max_results }) => {
+			async ({ query, max_results, include_nutrition }) => {
 				try {
 					const client = await this.getClient();
 					const raw = await client.searchFood(query);
 					const results = parseFoodSearch(raw).slice(0, max_results);
+
+					// find_food returns no nutrition at all, so per-100g values need a
+					// get_food per result. Run in parallel, and let a failure drop just
+					// that row's nutrition rather than failing the whole search.
+					if (include_nutrition !== false) {
+						await Promise.all(
+							results.map(async (r) => {
+								if (r.id == null) return;
+								try {
+									const food = await client.getFood(r.id);
+									const nutrients = parseFoodNutrients(food);
+									if (nutrients) r.per100g = nutrientsToMacros(nutrients);
+									r.measureGrams =
+										measureGramsFromFood(food, r.measureId) ?? r.measureGrams;
+								} catch {
+									/* leave this row without nutrition */
+								}
+							}),
+						);
+					}
 
 					const list =
 						results.length > 0
@@ -337,7 +424,18 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 										const ids =
 											`\n   food_id: ${r.id ?? "?"}` +
 											(r.measureId != null ? `, measure_id: ${r.measureId}` : "");
-										return `${i + 1}. ${r.name}${src}${ids}`;
+										const measure =
+											r.measureGrams != null
+												? `\n   measure: ${r.measureName ?? "1 serving"} = ${r.measureGrams} g`
+												: r.measureName
+													? `\n   measure: ${r.measureName}`
+													: "";
+										const nutrition = r.per100g
+											? `\n   per 100 g: ${macroLine(r.per100g)}`
+											: include_nutrition !== false
+												? "\n   per 100 g: (unavailable)"
+												: "";
+										return `${i + 1}. ${r.name}${src}${ids}${measure}${nutrition}`;
 									})
 									.join("\n")
 							: "No foods found (see raw response).";
@@ -346,6 +444,25 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 						content: [
 							{ type: "text", text: `Search results for "${query}"` },
 							{ type: "text", text: list },
+							{
+								type: "text",
+								text: `\n\nStructured results:\n${JSON.stringify(
+									results.map((r) => ({
+										food_id: r.id,
+										name: r.name,
+										measure_id: r.measureId,
+										measure_name: r.measureName,
+										measure_grams: r.measureGrams,
+										source: r.source,
+										kcal_per_100g: r.per100g?.calories,
+										protein_g_per_100g: r.per100g?.protein,
+										carbs_g_per_100g: r.per100g?.carbs,
+										fat_g_per_100g: r.per100g?.fat,
+									})),
+									null,
+									2,
+								)}`,
+							},
 							{ type: "text", text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}` },
 						],
 					};

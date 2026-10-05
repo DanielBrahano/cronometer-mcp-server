@@ -1,7 +1,10 @@
 import { Hono } from "hono";
 import type { Env, Variables } from "../types.js";
 import { CronometerClient } from "../lib/client.js";
+import { readSharedSession, writeSharedSession } from "../lib/session-cache.js";
+import { toCronoDay, todayDate } from "../lib/transforms.js";
 import { TOOL_CATALOG, TOOL_COUNT, TOOL_NAMES } from "../lib/tool-catalog.js";
+import { bearerAuth } from "../middleware/auth.js";
 
 const utilityRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
 
@@ -9,26 +12,43 @@ const utilityRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
  * Health check.
  *
  * Reports whether credentials are configured, the tool manifest, and — with
- * ?verify=1 — whether a live Cronometer login succeeds. Tool names come from the
- * same TOOL_CATALOG that mcp-agent.ts registers from, so this cannot drift from
- * what the Durable Object actually exposes. Pass ?verbose=1 for descriptions.
+ * ?verify=1 — whether the cached session can actually talk to Cronometer. Tool
+ * names come from the same TOOL_CATALOG that mcp-agent.ts registers from, so this
+ * cannot drift from what the Durable Object exposes. Pass ?verbose=1 for
+ * descriptions.
+ *
+ * ?verify=1 deliberately does *not* call verifyAuth(): that forces a fresh login,
+ * and a health check that spends a login on every call is itself a cause of
+ * Cronometer's "Too Many Attempts". It issues a cheap authenticated read with the
+ * cached session instead, and reports whether that cache was reused.
  */
 utilityRoutes.get("/health", async (c) => {
 	const hasCreds = !!(c.env.CRONOMETER_EMAIL && c.env.CRONOMETER_PASSWORD);
-	let loginOk: boolean | undefined;
-	let loginError: string | undefined;
+	let authOk: boolean | undefined;
+	let authError: string | undefined;
+	let sessionCached: boolean | undefined;
+	let sessionReused: boolean | undefined;
 
 	if (hasCreds && c.req.query("verify") === "1") {
+		const cached = await readSharedSession(c.env);
+		sessionCached = cached != null;
 		try {
 			const client = new CronometerClient({
 				email: c.env.CRONOMETER_EMAIL,
 				password: c.env.CRONOMETER_PASSWORD,
+				session: cached,
+				onSession: (s) => {
+					c.executionCtx.waitUntil(writeSharedSession(c.env, s));
+				},
 			});
-			await client.verifyAuth();
-			loginOk = true;
+			await client.getDiary(toCronoDay(todayDate()));
+			authOk = true;
+			// Same key still in use ⇒ the read was served by the cache, no login spent.
+			sessionReused =
+				cached != null && client.getSession()?.sessionKey === cached.sessionKey;
 		} catch (error) {
-			loginOk = false;
-			loginError = error instanceof Error ? error.message : "Unknown error";
+			authOk = false;
+			authError = error instanceof Error ? error.message : "Unknown error";
 		}
 	}
 
@@ -41,9 +61,69 @@ utilityRoutes.get("/health", async (c) => {
 		tool_count: TOOL_COUNT,
 		tools: TOOL_NAMES,
 		...(c.req.query("verbose") === "1" ? { tool_descriptions: TOOL_CATALOG } : {}),
-		...(loginOk !== undefined ? { login_ok: loginOk } : {}),
-		...(loginError ? { login_error: loginError } : {}),
+		...(authOk !== undefined ? { auth_ok: authOk, login_ok: authOk } : {}),
+		...(sessionCached !== undefined ? { session_cached: sessionCached } : {}),
+		...(sessionReused !== undefined ? { session_reused: sessionReused } : {}),
+		...(authError ? { auth_error: authError, login_error: authError } : {}),
 	});
+});
+
+/**
+ * Endpoint probe, for working out the shape of a reverse-engineered API call.
+ *
+ * Bearer-token gated and restricted to /api/ paths on Cronometer, using the
+ * cached session so probing costs no logins. Needed because Cronometer publishes
+ * no API documentation: the only way to implement a new call correctly is to see
+ * what the real endpoint returns.
+ *
+ *   GET  /debug/probe?endpoint=/api/v2/get_macro_target_templates
+ *   POST /debug/probe?endpoint=/api/v2/some_endpoint   { "payload": { ... } }
+ */
+utilityRoutes.all("/debug/probe", bearerAuth, async (c) => {
+	const endpoint = c.req.query("endpoint");
+	if (!endpoint) {
+		return c.json(
+			{ error: "bad_request", message: "Pass ?endpoint=/api/v2/<name>" },
+			400,
+		);
+	}
+
+	let payload: Record<string, unknown> = { config: { call_version: 1 } };
+	if (c.req.method === "POST") {
+		try {
+			const body = (await c.req.json()) as Record<string, unknown>;
+			if (body && typeof body.payload === "object" && body.payload !== null) {
+				payload = body.payload as Record<string, unknown>;
+			}
+		} catch {
+			// Keep the default payload when no valid JSON body is supplied.
+		}
+	}
+
+	const cached = await readSharedSession(c.env);
+	const client = new CronometerClient({
+		email: c.env.CRONOMETER_EMAIL,
+		password: c.env.CRONOMETER_PASSWORD,
+		session: cached,
+		onSession: (s) => {
+			c.executionCtx.waitUntil(writeSharedSession(c.env, s));
+		},
+	});
+
+	try {
+		const data = await client.rawV2(endpoint, payload);
+		return c.json({ ok: true, endpoint, payload_sent: payload, data });
+	} catch (error) {
+		const status = (error as { status?: number })?.status;
+		return c.json({
+			ok: false,
+			endpoint,
+			payload_sent: payload,
+			status: status ?? null,
+			message: error instanceof Error ? error.message : String(error),
+			data: (error as { data?: unknown })?.data ?? null,
+		});
+	}
 });
 
 const PAGE_STYLE = `

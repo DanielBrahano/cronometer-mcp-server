@@ -55,8 +55,84 @@ const READ_ONLY_ENDPOINTS = new Set([
 	"/api/v2/get_fasting_stats",
 ]);
 
+/**
+ * Cronometer throttles its login endpoint per account, and a burst of logins is
+ * exactly what trips "Too Many Attempts". These guards are module-level so every
+ * client built inside one Worker/Durable Object isolate shares them: a single hot
+ * isolate must not be able to stampede the login endpoint.
+ *
+ * This is the hard guarantee against a re-login spiral. The failure
+ * classification below is an optimisation on top of it, not the safety net.
+ */
+const MIN_LOGIN_INTERVAL_MS = 2_000;
+
+/** After Cronometer throttles a login, refuse to try again for this long. */
+const LOGIN_LOCKOUT_MS = 60_000;
+
+/** Minimum gap between consecutive diary writes, to stay under the limiter. */
+const MIN_WRITE_INTERVAL_MS = 350;
+
+let lastLoginAt = 0;
+let loginLockedOutUntil = 0;
+let loginLockoutReason = "";
+let inFlightLogin: Promise<CronometerSession> | null = null;
+let lastWriteAt = 0;
+
+/**
+ * Error text meaning Cronometer is throttling us. Re-authenticating in response
+ * to this makes it strictly worse, so these never trigger a login.
+ */
+const RATE_LIMIT_PATTERNS = [
+	"too many attempts",
+	"too many requests",
+	"rate limit",
+	"rate-limit",
+	"throttl",
+	"try again later",
+	"slow down",
+];
+
+/** Error text meaning the session itself is bad, where a fresh login helps. */
+const AUTH_FAILURE_PATTERNS = [
+	"session",
+	"not logged in",
+	"login required",
+	"must log in",
+	"unauthorized",
+	"unauthenticated",
+	"invalid token",
+	"bad token",
+	"authentication",
+	"expired",
+];
+
+function matchesAny(text: string, patterns: string[]): boolean {
+	const lower = text.toLowerCase();
+	return patterns.some((p) => lower.includes(p));
+}
+
+export function describesRateLimit(text: string): boolean {
+	return matchesAny(text, RATE_LIMIT_PATTERNS);
+}
+
+function describesAuthFailure(text: string): boolean {
+	return matchesAny(text, AUTH_FAILURE_PATTERNS);
+}
+
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Space out diary writes. Cronometer rejects rapid-fire writes, and the retry
+ * that follows a rejection costs more than the wait does.
+ */
+async function spaceWrites(): Promise<void> {
+	const since = Date.now() - lastWriteAt;
+	if (since < MIN_WRITE_INTERVAL_MS) {
+		await sleep(MIN_WRITE_INTERVAL_MS - since);
+	}
+	lastWriteAt = Date.now();
 }
 
 /**
@@ -207,14 +283,47 @@ export class CronometerClient {
 	// AUTH
 	// ============================================
 
-	/** Authenticate with email + password and cache the session key. */
+	/**
+	 * Authenticate and cache the session key.
+	 *
+	 * Concurrent callers share one round-trip (single-flight) and the attempt is
+	 * throttled, so a burst of tool calls that all find an empty cache cannot turn
+	 * into a burst of logins.
+	 */
 	async login(): Promise<CronometerSession> {
+		if (inFlightLogin) {
+			return inFlightLogin;
+		}
+		inFlightLogin = this.performLogin().finally(() => {
+			inFlightLogin = null;
+		});
+		return inFlightLogin;
+	}
+
+	private async performLogin(): Promise<CronometerSession> {
 		if (!this.email || !this.password) {
 			throw new CronometerApiError(
 				"Cronometer credentials are not configured. Set the CRONOMETER_EMAIL and CRONOMETER_PASSWORD Worker secrets.",
 				401,
 			);
 		}
+
+		const lockoutRemaining = loginLockedOutUntil - Date.now();
+		if (lockoutRemaining > 0) {
+			throw new CronometerApiError(
+				`Cronometer is rate-limiting logins for this account${
+					loginLockoutReason ? ` (${loginLockoutReason})` : ""
+				}. Not retrying for another ${Math.ceil(lockoutRemaining / 1000)}s — the cached session will be reused as soon as one is available.`,
+				429,
+				{ locked_out_for_ms: lockoutRemaining },
+			);
+		}
+
+		const sinceLastLogin = Date.now() - lastLoginAt;
+		if (sinceLastLogin < MIN_LOGIN_INTERVAL_MS) {
+			await sleep(MIN_LOGIN_INTERVAL_MS - sinceLastLogin);
+		}
+		lastLoginAt = Date.now();
 
 		const payload = {
 			email: this.email,
@@ -249,6 +358,21 @@ export class CronometerClient {
 		);
 
 		const data = await this.parseBody(res);
+		const obj = (data ?? {}) as Record<string, unknown>;
+
+		// "Too Many Attempts" arrives as a login rejection, not an HTTP 429. Treat
+		// it as a lockout so the next caller waits instead of hammering the limiter.
+		const bodyText = typeof data === "string" ? data : JSON.stringify(obj ?? {});
+		const detail = String(obj.error ?? obj.message ?? bodyText ?? "");
+		if (res.status === 429 || describesRateLimit(detail)) {
+			loginLockedOutUntil = Date.now() + LOGIN_LOCKOUT_MS;
+			loginLockoutReason = detail.slice(0, 120);
+			throw new CronometerApiError(
+				`Cronometer rejected the login as rate-limited: ${detail || "too many attempts"}. Pausing logins for ${LOGIN_LOCKOUT_MS / 1000}s.`,
+				429,
+				data,
+			);
+		}
 
 		if (!res.ok) {
 			throw new CronometerApiError(
@@ -258,7 +382,6 @@ export class CronometerClient {
 			);
 		}
 
-		const obj = (data ?? {}) as Record<string, unknown>;
 		const sessionKey = obj.sessionKey;
 		const id = obj.id;
 
@@ -269,6 +392,10 @@ export class CronometerClient {
 				data,
 			);
 		}
+
+		// A successful login clears any stale lockout.
+		loginLockedOutUntil = 0;
+		loginLockoutReason = "";
 
 		this.userId = typeof id === "number" ? id : Number(id);
 		this.sessionKey = sessionKey;
@@ -321,6 +448,11 @@ export class CronometerClient {
 	): Promise<T> {
 		await this.ensureAuth();
 
+		const replayable = READ_ONLY_ENDPOINTS.has(endpoint);
+		if (!replayable) {
+			await spaceWrites();
+		}
+
 		const body = { ...payload, auth: this.authBlock(), lastSeen: 0 };
 
 		const res = await fetchWithRetry(
@@ -334,16 +466,38 @@ export class CronometerClient {
 				},
 				body: JSON.stringify(body),
 			},
-			READ_ONLY_ENDPOINTS.has(endpoint),
+			replayable,
 			endpoint,
 		);
 
-		if ((res.status === 401 || res.status === 403) && !isRetry) {
+		const data = await this.parseBody(res);
+		const obj =
+			data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+		const detail = String(
+			obj.error ?? obj.message ?? (typeof data === "string" ? data : ""),
+		);
+
+		// Throttling is handled first, and never followed by a login: re-authenticating
+		// is what turns one rate-limited call into "Too Many Attempts" for the account.
+		if (res.status === 429 || describesRateLimit(detail)) {
+			throw new CronometerApiError(
+				`Cronometer is rate-limiting this account: ${detail || "too many requests"}. Wait before retrying — the cached session is still valid, so no re-login is needed.`,
+				429,
+				data,
+			);
+		}
+
+		if (res.status === 401 || res.status === 403) {
+			if (isRetry) {
+				throw new CronometerApiError(
+					`Cronometer rejected the request even after re-authenticating: ${res.status} ${res.statusText}`,
+					res.status,
+					data,
+				);
+			}
 			await this.ensureAuth(true);
 			return this.v2<T>(endpoint, payload, true);
 		}
-
-		const data = await this.parseBody(res);
 
 		if (!res.ok) {
 			throw new CronometerApiError(
@@ -353,20 +507,25 @@ export class CronometerClient {
 			);
 		}
 
-		// Some endpoints signal auth/session failure in the JSON body.
-		if (data && typeof data === "object") {
-			const result = (data as Record<string, unknown>).result;
-			if ((result === "FAILURE" || result === "FAIL") && !isRetry) {
+		// Some endpoints signal failure in the body of an HTTP 200.
+		const result = obj.result;
+		if (result === "FAILURE" || result === "FAIL") {
+			// Only a genuine session problem justifies spending a login. A rejected
+			// write (bad measure_id, unknown food_id) is not an auth failure, and
+			// re-authenticating for those is what exhausted the login limiter before.
+			// An unclassifiable failure still gets one attempt, because a silently
+			// expired session reports nothing useful — the login throttle bounds the
+			// cost so this cannot become a spiral.
+			if (!isRetry && (describesAuthFailure(detail) || detail.trim() === "")) {
 				await this.ensureAuth(true);
 				return this.v2<T>(endpoint, payload, true);
 			}
-			if (result === "FAILURE" || result === "FAIL") {
-				throw new CronometerApiError(
-					`Cronometer API error: ${String((data as Record<string, unknown>).error ?? "request failed")}`,
-					502,
-					data,
-				);
-			}
+
+			throw new CronometerApiError(
+				`Cronometer rejected the request: ${detail || "request failed"}`,
+				502,
+				data,
+			);
 		}
 
 		return data as T;
@@ -405,6 +564,43 @@ export class CronometerClient {
 			day,
 			config: { call_version: 1 },
 		});
+	}
+
+	// ============================================
+	// GOALS / MACRO TARGETS
+	// ============================================
+
+	/**
+	 * Read the account's macro target templates.
+	 *
+	 * The diary response carries the *resolved* targets in `summary.macros` plus
+	 * the active template in `summary.template`; this endpoint returns the stored
+	 * templates themselves, which is what a goal change has to write back.
+	 */
+	async getMacroTargetTemplates(): Promise<any> {
+		return this.v2<any>("/api/v2/get_macro_target_templates", {
+			config: { call_version: 1 },
+		});
+	}
+
+	/**
+	 * Send an arbitrary v2 call with the session attached.
+	 *
+	 * The Cronometer API is reverse-engineered, so confirming an endpoint's real
+	 * request/response shape is sometimes the only way to implement against it.
+	 * Treated as non-replayable, so a call is never retried automatically.
+	 */
+	async rawV2<T = any>(
+		endpoint: string,
+		payload: Record<string, unknown> = {},
+	): Promise<T> {
+		if (!endpoint.startsWith("/api/")) {
+			throw new CronometerApiError(
+				`Refusing to call "${endpoint}": endpoint must start with /api/`,
+				400,
+			);
+		}
+		return this.v2<T>(endpoint, payload);
 	}
 
 	/** Log a food serving to the diary. */
@@ -494,6 +690,8 @@ export class CronometerClient {
 		if (toDelete.length === 0) {
 			return 0;
 		}
+
+		await spaceWrites();
 
 		const res = await fetchWithRetry(
 			`${this.baseUrl}/api/v3/user/${this.userId}/diary-entries`,

@@ -7,6 +7,8 @@
  * also returns the raw API JSON, so data is usable even if a field differs.
  */
 
+import { NUTRIENT_IDS } from "./client.js";
+
 export class ValidationError extends Error {
 	constructor(message: string) {
 		super(message);
@@ -92,6 +94,11 @@ function num(value: unknown): number {
 	return 0;
 }
 
+/** Round a macro block for display: whole kcal, one decimal on grams. */
+export function roundMacros(m: Macros): Macros {
+	return round(m);
+}
+
 function round(m: Macros): Macros {
 	return {
 		calories: Math.round(m.calories),
@@ -130,6 +137,131 @@ export interface DiaryEntry {
 	foodId?: number;
 	grams?: number;
 	mealGroup?: number;
+	/** Measure the entry was logged against (0 when logged by raw grams). */
+	measureId?: number;
+}
+
+/**
+ * Per-100g macros for a food, read from a get_food response.
+ *
+ * Cronometer stores every food's nutrients on a per-100g basis (the same basis
+ * create_custom_food scales to when writing), so a logged entry's contribution
+ * is these figures times grams/100.
+ */
+export interface FoodNutrients {
+	caloriesPer100g: number;
+	proteinPer100g: number;
+	carbsPer100g: number;
+	fatPer100g: number;
+}
+
+/**
+ * Extract per-100g macros from a get_food response.
+ *
+ * The nutrients block is parsed defensively: the API returns an array of
+ * `{ id, amount }`, but variants key the amounts by nutrient id instead.
+ * Returns null when no nutrient data is present, so callers can degrade to
+ * showing the entry without macros rather than reporting zeroes as fact.
+ */
+export function parseFoodNutrients(food: any): FoodNutrients | null {
+	const raw = food?.nutrients;
+	if (!raw) {
+		return null;
+	}
+
+	const byId = new Map<number, number>();
+	if (Array.isArray(raw)) {
+		for (const n of raw) {
+			const id = Number(n?.id);
+			if (Number.isFinite(id)) {
+				byId.set(id, num(n?.amount ?? n?.value));
+			}
+		}
+	} else if (typeof raw === "object") {
+		for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+			const id = Number(key);
+			if (Number.isFinite(id)) {
+				byId.set(id, num(value));
+			}
+		}
+	}
+
+	if (byId.size === 0) {
+		return null;
+	}
+
+	return {
+		caloriesPer100g: byId.get(NUTRIENT_IDS.energy) ?? 0,
+		proteinPer100g: byId.get(NUTRIENT_IDS.protein) ?? 0,
+		carbsPer100g: byId.get(NUTRIENT_IDS.carbs) ?? 0,
+		fatPer100g: byId.get(NUTRIENT_IDS.fat) ?? 0,
+	};
+}
+
+/** Per-100g macros as a Macros block (for reporting a food's density). */
+export function nutrientsToMacros(n: FoodNutrients): Macros {
+	return round({
+		calories: n.caloriesPer100g,
+		protein: n.proteinPer100g,
+		carbs: n.carbsPer100g,
+		fat: n.fatPer100g,
+	});
+}
+
+/** Scale per-100g macros to the amount actually logged. */
+export function scaleNutrients(n: FoodNutrients, grams: number): Macros {
+	const factor = grams / 100;
+	return round({
+		calories: n.caloriesPer100g * factor,
+		protein: n.proteinPer100g * factor,
+		carbs: n.carbsPer100g * factor,
+		fat: n.fatPer100g * factor,
+	});
+}
+
+/**
+ * Gram weight of a measure from its display name, e.g.
+ * "1 piece - 140g" → 140, "4 oz - 112g" → 112, "1g" → 1.
+ * find_food returns no gram field, but it encodes one in this label.
+ */
+export function parseMeasureGrams(displayName: unknown): number | undefined {
+	if (typeof displayName !== "string") {
+		return undefined;
+	}
+	const suffixed = displayName.match(/-\s*([\d.]+)\s*g\s*$/i);
+	if (suffixed) {
+		const grams = Number.parseFloat(suffixed[1]);
+		return Number.isFinite(grams) ? grams : undefined;
+	}
+	const bare = displayName.match(/^\s*([\d.]+)\s*g\s*$/i);
+	if (bare) {
+		const grams = Number.parseFloat(bare[1]);
+		return Number.isFinite(grams) ? grams : undefined;
+	}
+	return undefined;
+}
+
+/** Gram weight of a specific measure id from a get_food response. */
+export function measureGramsFromFood(
+	food: any,
+	measureId: number | undefined,
+): number | undefined {
+	const measures: any[] = Array.isArray(food?.measures) ? food.measures : [];
+	if (measures.length === 0) {
+		return undefined;
+	}
+	const match =
+		measureId != null
+			? measures.find((m) => Number(m?.id) === Number(measureId))
+			: undefined;
+	const chosen =
+		match ??
+		(food?.defaultMeasureId != null
+			? measures.find((m) => Number(m?.id) === Number(food.defaultMeasureId))
+			: undefined) ??
+		measures[0];
+	const grams = num(chosen?.value);
+	return grams > 0 ? grams : undefined;
 }
 
 /** Parse a get_diary response into a compact list of logged entries. */
@@ -155,6 +287,7 @@ export function parseDiary(response: any): DiaryEntry[] {
 			foodId: e.foodId,
 			grams: typeof e.grams === "number" ? e.grams : undefined,
 			mealGroup: typeof e.order === "number" ? e.order >> 16 : undefined,
+			measureId: typeof e.measureId === "number" ? e.measureId : undefined,
 		}));
 }
 
@@ -164,6 +297,12 @@ export interface FoodResult {
 	measureId?: number;
 	translationId?: number;
 	source?: string;
+	/** Gram weight of this result's measure, when the API encodes one. */
+	measureGrams?: number;
+	/** Human label for the measure, e.g. "1 piece - 140g". */
+	measureName?: string;
+	/** Per-100g macros. Only set once food details have been resolved. */
+	per100g?: Macros;
 }
 
 /** Parse a find_food response into a compact result list. */
@@ -182,6 +321,9 @@ export function parseFoodSearch(response: any): FoodResult[] {
 		measureId: f.measureId ?? f.measure_id,
 		translationId: f.translationId ?? f.translation_id ?? 0,
 		source: f.source,
+		measureName:
+			typeof f.measureDisplayName === "string" ? f.measureDisplayName : undefined,
+		measureGrams: parseMeasureGrams(f.measureDisplayName),
 	}));
 }
 
