@@ -55,7 +55,9 @@ const REFERENCE_PATTERNS = [
 
 function classify(error: CronometerApiError): ErrorKind {
 	const detail = `${error.message} ${
-		typeof error.data === "string" ? error.data : JSON.stringify(error.data ?? {})
+		typeof error.data === "string"
+			? error.data
+			: JSON.stringify(error.data ?? {})
 	}`.toLowerCase();
 
 	if (error.status === 429) return "rate_limited";
@@ -74,7 +76,10 @@ function classify(error: CronometerApiError): ErrorKind {
 
 	// A 502 is how a body-level rejection surfaces; those are usually a bad
 	// food_id / measure_id rather than a genuine upstream fault.
-	if (error.status === 502 && REFERENCE_PATTERNS.some((p) => detail.includes(p))) {
+	if (
+		error.status === 502 &&
+		REFERENCE_PATTERNS.some((p) => detail.includes(p))
+	) {
 		return "invalid_reference";
 	}
 
@@ -112,7 +117,9 @@ const FIX_HINTS: Record<ErrorKind, string[]> = {
 };
 
 /** Format a CronometerApiError into an MCP tool response, preserving API detail. */
-export function formatCronometerApiError(error: CronometerApiError): McpToolResponse {
+export function formatCronometerApiError(
+	error: CronometerApiError,
+): McpToolResponse {
 	const kind = classify(error);
 	const parts: string[] = [];
 	parts.push(`❌ ${getStatusMessage(error.status)} [error_kind: ${kind}]`);
@@ -184,7 +191,10 @@ export function handleError(error: unknown): McpToolResponse {
 	if (error instanceof Error) {
 		return {
 			content: [
-				{ type: "text", text: `❌ Error [error_kind: unknown]: ${error.message}` },
+				{
+					type: "text",
+					text: `❌ Error [error_kind: unknown]: ${error.message}`,
+				},
 			],
 			isError: true,
 			errorKind: "unknown",

@@ -362,7 +362,8 @@ export class CronometerClient {
 
 		// "Too Many Attempts" arrives as a login rejection, not an HTTP 429. Treat
 		// it as a lockout so the next caller waits instead of hammering the limiter.
-		const bodyText = typeof data === "string" ? data : JSON.stringify(obj ?? {});
+		const bodyText =
+			typeof data === "string" ? data : JSON.stringify(obj ?? {});
 		const detail = String(obj.error ?? obj.message ?? bodyText ?? "");
 		if (res.status === 429 || describesRateLimit(detail)) {
 			loginLockedOutUntil = Date.now() + LOGIN_LOCKOUT_MS;
@@ -584,6 +585,151 @@ export class CronometerClient {
 	}
 
 	/**
+	 * Candidate endpoints for writing macro targets, most likely first.
+	 *
+	 * Cronometer documents no API, and the mobile app's setter for this is not
+	 * among the calls we have observed, so the name has to be established
+	 * empirically. The v2 API names things get_x / set_x / add_x consistently
+	 * (get_diary / set_complete / add_serving / add_food), which is what this list
+	 * follows. Every attempt is verified against the diary afterwards, so a wrong
+	 * guess is reported as "not applied" rather than assumed to have worked.
+	 */
+	private static readonly MACRO_TARGET_WRITE_ENDPOINTS = [
+		"/api/v2/set_macro_target_template",
+		"/api/v2/save_macro_target_template",
+		"/api/v2/set_macro_targets",
+		"/api/v2/add_macro_target_template",
+	] as const;
+
+	/**
+	 * Write macro targets, then confirm from the diary that they took effect.
+	 *
+	 * Cronometer stores macro targets as a template that is either percentage-based
+	 * (`grams: false`, the default) or gram-based (`grams: true`). Gram targets are
+	 * therefore written by flipping the template into gram mode. The calorie figure
+	 * is a separate field on the template's resolved output and is passed through
+	 * when supplied.
+	 *
+	 * Returns what was attempted and what actually changed, so the caller can tell
+	 * a real success from a silently ignored write.
+	 */
+	async setMacroTargets(target: {
+		calories?: number;
+		protein_g?: number;
+		carbs_g?: number;
+		fat_g?: number;
+	}): Promise<{
+		applied: boolean;
+		endpoint?: string;
+		before: Record<string, unknown>;
+		after: Record<string, unknown>;
+		templateBefore: Record<string, unknown>;
+		templateSent: Record<string, unknown>;
+		storedTemplates: unknown;
+		attempts: Array<{ endpoint: string; ok: boolean; message: string }>;
+	}> {
+		const today = `${new Date().getUTCFullYear()}-${new Date().getUTCMonth() + 1}-${new Date().getUTCDate()}`;
+
+		const diaryBefore = await this.getDiary(today);
+		const before = (diaryBefore?.summary?.macros ?? {}) as Record<
+			string,
+			unknown
+		>;
+		const templateBefore = (diaryBefore?.template ?? {}) as Record<
+			string,
+			unknown
+		>;
+
+		// Read the stored templates too: the diary exposes the active one, but the
+		// write has to round-trip whatever the store actually holds.
+		let storedTemplates: unknown = null;
+		try {
+			storedTemplates = await this.getMacroTargetTemplates();
+		} catch (error) {
+			storedTemplates = {
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
+
+		const gramsGiven =
+			target.protein_g != null ||
+			target.carbs_g != null ||
+			target.fat_g != null;
+
+		const templateSent: Record<string, unknown> = {
+			...templateBefore,
+			id: templateBefore.id ?? 0,
+			name: templateBefore.name ?? "Default Macronutrient Targets",
+		};
+
+		if (gramsGiven) {
+			// Gram mode: the three macro fields carry grams rather than percentages.
+			templateSent.grams = true;
+			if (target.protein_g != null) templateSent.protein = target.protein_g;
+			if (target.carbs_g != null) templateSent.carbs = target.carbs_g;
+			if (target.fat_g != null) templateSent.fat = target.fat_g;
+		}
+		if (target.calories != null) {
+			templateSent.energy = target.calories;
+			templateSent.calories = target.calories;
+		}
+
+		const attempts: Array<{ endpoint: string; ok: boolean; message: string }> =
+			[];
+		let endpointUsed: string | undefined;
+
+		for (const endpoint of CronometerClient.MACRO_TARGET_WRITE_ENDPOINTS) {
+			try {
+				await this.v2(endpoint, {
+					template: templateSent,
+					data: templateSent,
+					config: { call_version: 1 },
+				});
+				attempts.push({ endpoint, ok: true, message: "accepted" });
+				endpointUsed = endpoint;
+				break;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				attempts.push({ endpoint, ok: false, message });
+
+				// A rate limit is about us, not about the endpoint being wrong. Stop
+				// immediately rather than burning the remaining candidates on it.
+				if (error instanceof CronometerApiError && error.status === 429) {
+					break;
+				}
+			}
+		}
+
+		const diaryAfter = await this.getDiary(today);
+		const after = (diaryAfter?.summary?.macros ?? {}) as Record<
+			string,
+			unknown
+		>;
+
+		const changed = (field: string, want?: number) =>
+			want == null || Math.abs(Number(after[field] ?? 0) - want) < 1;
+
+		const applied =
+			endpointUsed != null &&
+			JSON.stringify(before) !== JSON.stringify(after) &&
+			changed("protein", target.protein_g) &&
+			changed("carbs", target.carbs_g) &&
+			changed("fat", target.fat_g) &&
+			changed("energy", target.calories);
+
+		return {
+			applied,
+			endpoint: endpointUsed,
+			before,
+			after,
+			templateBefore,
+			templateSent,
+			storedTemplates,
+			attempts,
+		};
+	}
+
+	/**
 	 * Send an arbitrary v2 call with the session attached.
 	 *
 	 * The Cronometer API is reverse-engineered, so confirming an endpoint's real
@@ -681,12 +827,17 @@ export class CronometerClient {
 	 * the full serving objects (required by the v3 API), then issues a v3 DELETE
 	 * (auth via x-crono-session header). Returns the count removed.
 	 */
-	async deleteServings(day: string, servingIds: Array<string | number>): Promise<number> {
+	async deleteServings(
+		day: string,
+		servingIds: Array<string | number>,
+	): Promise<number> {
 		await this.ensureAuth();
 		const diary = await this.getDiary(day);
 		const entries: any[] = Array.isArray(diary?.diary) ? diary.diary : [];
 		const idSet = new Set(servingIds.map((s) => String(s)));
-		const toDelete = entries.filter((e) => idSet.has(String(e?.servingId ?? e?.id)));
+		const toDelete = entries.filter((e) =>
+			idSet.has(String(e?.servingId ?? e?.id)),
+		);
 		if (toDelete.length === 0) {
 			return 0;
 		}

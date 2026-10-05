@@ -1,10 +1,7 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import {
-	CronometerClient,
-	type CronometerSession,
-} from "./lib/client.js";
+import { CronometerClient, type CronometerSession } from "./lib/client.js";
 import { handleError } from "./lib/errors.js";
 import { readSharedSession, writeSharedSession } from "./lib/session-cache.js";
 import { TOOL_CATALOG } from "./lib/tool-catalog.js";
@@ -90,8 +87,8 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 			password,
 			session,
 			onSession: (s) => {
-				this.setState({ session: s });   // sync: local SQLite
-				this.saveSharedSession(s);        // async fire-and-forget: shared store
+				this.setState({ session: s }); // sync: local SQLite
+				this.saveSharedSession(s); // async fire-and-forget: shared store
 			},
 		});
 	}
@@ -161,8 +158,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 							serving_id: e.servingId,
 							food_id: e.foodId,
 							name: (e.foodId != null && nameById.get(e.foodId)) || e.name,
-							meal:
-								e.mealGroup != null ? MEAL_NAMES[e.mealGroup] : undefined,
+							meal: e.mealGroup != null ? MEAL_NAMES[e.mealGroup] : undefined,
 							grams: e.grams,
 							measure_id: e.measureId,
 							kcal: macros?.calories,
@@ -284,7 +280,9 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 					const overall = averageMacros(daily);
 					const last7 = averageMacros(daily.slice(-7));
 
-					const rows = daily.map((d) => `${d.date}: ${macroLine(d)}`).join("\n");
+					const rows = daily
+						.map((d) => `${d.date}: ${macroLine(d)}`)
+						.join("\n");
 
 					return {
 						content: [
@@ -297,7 +295,10 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 								text: `Average over range: ${macroLine(overall)}\n7-day average (most recent): ${macroLine(last7)}`,
 							},
 							{ type: "text", text: `Daily totals:\n${rows}` },
-							{ type: "text", text: `\n\nRaw daily data:\n${JSON.stringify(daily, null, 2)}` },
+							{
+								type: "text",
+								text: `\n\nRaw daily data:\n${JSON.stringify(daily, null, 2)}`,
+							},
 						],
 					};
 				} catch (error) {
@@ -315,19 +316,132 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 				const diaryRaw = await client.getDiary(toCronoDay(todayDate()));
 				const { goals, raw } = parseGoals(diaryRaw);
 
+				// Whether the targets are percentage- or gram-based decides what
+				// set_goals has to write, so it is worth stating alongside the numbers.
+				const template = diaryRaw?.template;
+				const mode = template
+					? template.grams === true
+						? "gram-based"
+						: "percentage-based"
+					: "unknown";
+				const split =
+					template && template.grams !== true
+						? ` (${template.protein}% protein / ${template.carbs}% carbs / ${template.fat}% fat of the calorie goal)`
+						: "";
+
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Daily goals\nCalories: ${goals.calories} kcal\nProtein: ${goals.protein} g\nCarbs: ${goals.carbs} g\nFat: ${goals.fat} g`,
+							text: `Daily goals\nCalories: ${goals.calories} kcal\nProtein: ${goals.protein} g\nCarbs: ${goals.carbs} g\nFat: ${goals.fat} g\n\nTargets are ${mode}${split}.`,
 						},
-						{ type: "text", text: `\n\nRaw summary:\n${JSON.stringify(raw, null, 2)}` },
+						{
+							type: "text",
+							text: `\n\nActive template:\n${JSON.stringify(template ?? null, null, 2)}`,
+						},
+						{
+							type: "text",
+							text: `\n\nRaw summary:\n${JSON.stringify(raw, null, 2)}`,
+						},
 					],
 				};
 			} catch (error) {
 				return handleError(error);
 			}
 		});
+
+		// ============================================
+		// WRITE — SET GOALS (daily macro targets)
+		// ============================================
+		this.server.tool(
+			"set_goals",
+			TOOL_CATALOG.set_goals,
+			{
+				calories: z
+					.number()
+					.positive()
+					.optional()
+					.describe("New daily calorie target in kcal."),
+				protein_g: z
+					.number()
+					.nonnegative()
+					.optional()
+					.describe("New daily protein target in grams."),
+				carbs_g: z
+					.number()
+					.nonnegative()
+					.optional()
+					.describe("New daily carbohydrate target in grams."),
+				fat_g: z
+					.number()
+					.nonnegative()
+					.optional()
+					.describe("New daily fat target in grams."),
+			},
+			async ({ calories, protein_g, carbs_g, fat_g }) => {
+				try {
+					if (
+						calories == null &&
+						protein_g == null &&
+						carbs_g == null &&
+						fat_g == null
+					) {
+						return {
+							content: [
+								{
+									type: "text",
+									text: "Provide at least one of: calories, protein_g, carbs_g, fat_g.",
+								},
+							],
+						};
+					}
+
+					const client = await this.getClient();
+					const result = await client.setMacroTargets({
+						calories,
+						protein_g,
+						carbs_g,
+						fat_g,
+					});
+
+					const fmt = (m: Record<string, unknown>) =>
+						`${Math.round(Number(m.energy ?? 0))} kcal · P ${Math.round(Number(m.protein ?? 0))}g · C ${Math.round(Number(m.carbs ?? 0))}g · F ${Math.round(Number(m.fat ?? 0))}g`;
+
+					// Reported honestly either way: Cronometer's macro-target setter is
+					// not a documented endpoint, so the write is verified against the
+					// diary rather than assumed to have worked.
+					const headline = result.applied
+						? `✓ Updated daily targets.\nBefore: ${fmt(result.before)}\nAfter:  ${fmt(result.after)}`
+						: `⚠️ Could not confirm the targets changed — Cronometer did not apply the write.\nTargets are still: ${fmt(result.after)}\n\nThis is the one tool whose Cronometer endpoint is unverified: the mobile API exposes no documented macro-target setter, so ${result.attempts.length} candidate endpoint(s) were tried and verified against the diary. Nothing was changed. The attempt log below identifies the right endpoint.`;
+
+					return {
+						content: [
+							{ type: "text", text: headline },
+							{
+								type: "text",
+								text: `\n\nAttempts:\n${JSON.stringify(result.attempts, null, 2)}`,
+							},
+							{
+								type: "text",
+								text: `\n\nDiagnostics:\n${JSON.stringify(
+									{
+										endpoint_used: result.endpoint ?? null,
+										template_before: result.templateBefore,
+										template_sent: result.templateSent,
+										stored_templates: result.storedTemplates,
+									},
+									null,
+									2,
+								)}`,
+							},
+						],
+						isError: !result.applied,
+					};
+				} catch (error) {
+					return handleError(error);
+				}
+			},
+		);
 
 		// ============================================
 		// READ — NUTRITION SCORES
@@ -373,7 +487,9 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 			"search_food",
 			TOOL_CATALOG.search_food,
 			{
-				query: z.string().describe("Food to search for, e.g. 'chicken breast'."),
+				query: z
+					.string()
+					.describe("Food to search for, e.g. 'chicken breast'."),
 				max_results: z
 					.number()
 					.int()
@@ -423,7 +539,9 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 										const src = r.source ? ` [${r.source}]` : "";
 										const ids =
 											`\n   food_id: ${r.id ?? "?"}` +
-											(r.measureId != null ? `, measure_id: ${r.measureId}` : "");
+											(r.measureId != null
+												? `, measure_id: ${r.measureId}`
+												: "");
 										const measure =
 											r.measureGrams != null
 												? `\n   measure: ${r.measureName ?? "1 serving"} = ${r.measureGrams} g`
@@ -463,7 +581,10 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 									2,
 								)}`,
 							},
-							{ type: "text", text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}` },
+							{
+								type: "text",
+								text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}`,
+							},
 						],
 					};
 				} catch (error) {
@@ -486,10 +607,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 					.number()
 					.int()
 					.describe("Cronometer food_id (from search_food)."),
-				grams: z
-					.number()
-					.positive()
-					.describe("Amount in grams to log."),
+				grams: z.number().positive().describe("Amount in grams to log."),
 				measure_id: z
 					.number()
 					.int()
@@ -513,9 +631,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 					if (resolvedMeasureId == null) {
 						const food = await client.getFood(food_id);
 						resolvedMeasureId =
-							food?.defaultMeasureId ??
-							food?.measures?.[0]?.id ??
-							0;
+							food?.defaultMeasureId ?? food?.measures?.[0]?.id ?? 0;
 					}
 
 					const raw = await client.addServing({
@@ -533,7 +649,10 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 								type: "text",
 								text: `✓ Logged ${grams} g of food ${food_id} to ${meal_name} on ${d}.`,
 							},
-							{ type: "text", text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}` },
+							{
+								type: "text",
+								text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}`,
+							},
 						],
 					};
 				} catch (error) {
@@ -641,7 +760,10 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 								type: "text",
 								text: `✓ Updated serving ${serving_id} on ${d}: ${parts.join(", ")}.`,
 							},
-							{ type: "text", text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}` },
+							{
+								type: "text",
+								text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}`,
+							},
 						],
 					};
 				} catch (error) {
@@ -660,9 +782,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 				from_date: z
 					.string()
 					.optional()
-					.describe(
-						"Date to copy FROM (YYYY-MM-DD). Defaults to yesterday.",
-					),
+					.describe("Date to copy FROM (YYYY-MM-DD). Defaults to yesterday."),
 				to_date: z
 					.string()
 					.optional()
@@ -689,7 +809,10 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 								type: "text",
 								text: `✓ Copied diary entries from ${fromD} to ${toD}.`,
 							},
-							{ type: "text", text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}` },
+							{
+								type: "text",
+								text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}`,
+							},
 						],
 					};
 				} catch (error) {
@@ -720,12 +843,18 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 					const d = date ?? todayDate();
 					validateDate(d, "date");
 					const client = await this.getClient();
-					const raw = await client.setDayComplete(toCronoDay(d), complete ?? true);
+					const raw = await client.setDayComplete(
+						toCronoDay(d),
+						complete ?? true,
+					);
 					const status = (complete ?? true) ? "complete" : "incomplete";
 					return {
 						content: [
 							{ type: "text", text: `✓ Marked ${d} as ${status}.` },
-							{ type: "text", text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}` },
+							{
+								type: "text",
+								text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}`,
+							},
 						],
 					};
 				} catch (error) {
@@ -743,9 +872,15 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 			{
 				name: z.string().describe("Food name (e.g. 'My Protein Bar')."),
 				calories: z.number().nonnegative().describe("Calories per serving."),
-				protein_g: z.number().nonnegative().describe("Protein in grams per serving."),
+				protein_g: z
+					.number()
+					.nonnegative()
+					.describe("Protein in grams per serving."),
 				fat_g: z.number().nonnegative().describe("Fat in grams per serving."),
-				carbs_g: z.number().nonnegative().describe("Carbohydrates in grams per serving."),
+				carbs_g: z
+					.number()
+					.nonnegative()
+					.describe("Carbohydrates in grams per serving."),
 				fiber_g: z
 					.number()
 					.nonnegative()
@@ -847,12 +982,18 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 					validateDate(end, "end_date");
 
 					const client = await this.getClient();
-					const raw = await client.getFastingHistory(toCronoDay(start), toCronoDay(end));
+					const raw = await client.getFastingHistory(
+						toCronoDay(start),
+						toCronoDay(end),
+					);
 
 					return {
 						content: [
 							{ type: "text", text: `Fasting history ${start} → ${end}` },
-							{ type: "text", text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}` },
+							{
+								type: "text",
+								text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}`,
+							},
 						],
 					};
 				} catch (error) {
@@ -864,20 +1005,28 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 		// ============================================
 		// READ — FASTING STATS
 		// ============================================
-		this.server.tool("get_fasting_stats", TOOL_CATALOG.get_fasting_stats, {}, async () => {
-			try {
-				const client = await this.getClient();
-				const raw = await client.getFastingStats();
+		this.server.tool(
+			"get_fasting_stats",
+			TOOL_CATALOG.get_fasting_stats,
+			{},
+			async () => {
+				try {
+					const client = await this.getClient();
+					const raw = await client.getFastingStats();
 
-				return {
-					content: [
-						{ type: "text", text: "Overall fasting statistics" },
-						{ type: "text", text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}` },
-					],
-				};
-			} catch (error) {
-				return handleError(error);
-			}
-		});
+					return {
+						content: [
+							{ type: "text", text: "Overall fasting statistics" },
+							{
+								type: "text",
+								text: `\n\nRaw API response:\n${JSON.stringify(raw, null, 2)}`,
+							},
+						],
+					};
+				} catch (error) {
+					return handleError(error);
+				}
+			},
+		);
 	}
 }

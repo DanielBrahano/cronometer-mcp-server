@@ -322,7 +322,9 @@ export function parseFoodSearch(response: any): FoodResult[] {
 		translationId: f.translationId ?? f.translation_id ?? 0,
 		source: f.source,
 		measureName:
-			typeof f.measureDisplayName === "string" ? f.measureDisplayName : undefined,
+			typeof f.measureDisplayName === "string"
+				? f.measureDisplayName
+				: undefined,
 		measureGrams: parseMeasureGrams(f.measureDisplayName),
 	}));
 }
@@ -367,7 +369,11 @@ export function averageMacros(days: Macros[]): Macros {
  * Inclusive list of YYYY-MM-DD dates from start to end. Throws if the range is
  * reversed or exceeds maxDays.
  */
-export function enumerateDates(start: string, end: string, maxDays = 31): string[] {
+export function enumerateDates(
+	start: string,
+	end: string,
+	maxDays = 31,
+): string[] {
 	const startMs = Date.parse(`${start}T00:00:00Z`);
 	const endMs = Date.parse(`${end}T00:00:00Z`);
 	if (endMs < startMs) {

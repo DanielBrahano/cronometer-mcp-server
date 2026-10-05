@@ -26,6 +26,9 @@ export const TOOL_CATALOG = {
 	get_goals:
 		"Return the daily nutrition targets set in Cronometer — calorie goal plus protein, carb and fat targets in grams. Use to answer 'what are my macros', or as the denominator when reporting how much of the day's budget is left.",
 
+	set_goals:
+		"Change the daily nutrition targets in Cronometer — calorie goal and/or protein, carb and fat targets in grams. Use when the user wants to raise or lower their macros, e.g. 'set my protein target to 180g'. Verifies the change against the diary afterwards and reports whether it actually took effect, so a rejected write is never reported as a success. Read current targets with get_goals first.",
+
 	get_nutrition_scores:
 		"Return Cronometer's nutrient-quality scoring for a day — how well micronutrient and macronutrient targets were met, beyond raw calories. Use for diet-quality questions: 'how balanced was my day', 'what nutrients am I short on'. Defaults to today.",
 

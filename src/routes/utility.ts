@@ -60,7 +60,9 @@ utilityRoutes.get("/health", async (c) => {
 		credentials_configured: hasCreds,
 		tool_count: TOOL_COUNT,
 		tools: TOOL_NAMES,
-		...(c.req.query("verbose") === "1" ? { tool_descriptions: TOOL_CATALOG } : {}),
+		...(c.req.query("verbose") === "1"
+			? { tool_descriptions: TOOL_CATALOG }
+			: {}),
 		...(authOk !== undefined ? { auth_ok: authOk, login_ok: authOk } : {}),
 		...(sessionCached !== undefined ? { session_cached: sessionCached } : {}),
 		...(sessionReused !== undefined ? { session_reused: sessionReused } : {}),
@@ -171,7 +173,8 @@ wrangler secret put CRONOMETER_PASSWORD</pre></li>
 			<code>get_goals</code>, <code>get_nutrition_scores</code>, <code>search_food</code>,
 			<code>get_fasting_history</code>, <code>get_fasting_stats</code><br>
 			<strong>Write:</strong> <code>log_food</code>, <code>delete_food</code>, <code>update_food</code>,
-			<code>copy_day</code>, <code>mark_day_complete</code>, <code>create_custom_food</code></div>
+			<code>copy_day</code>, <code>mark_day_complete</code>, <code>create_custom_food</code>,
+			<code>set_goals</code></div>
 		<p style="margin-top:1rem"><a href="/health">Health check</a></p>
 	</div>
 </div></body></html>`);
