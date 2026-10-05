@@ -153,6 +153,20 @@ export interface FoodNutrients {
 	proteinPer100g: number;
 	carbsPer100g: number;
 	fatPer100g: number;
+	fiberPer100g: number;
+}
+
+/**
+ * A logged entry's contribution, carrying both carb bases.
+ *
+ * `carbs` is total carbohydrate (nutrient 205). Cronometer's own daily figure in
+ * `summary.consumed.carbs_g` is *net* carbs, so the two only reconcile once fiber
+ * is accounted for — reporting both is what makes the per-item numbers add up to
+ * the day's total instead of looking inflated by the fiber amount.
+ */
+export interface EntryMacros extends Macros {
+	fiber: number;
+	netCarbs: number;
 }
 
 /**
@@ -195,28 +209,33 @@ export function parseFoodNutrients(food: any): FoodNutrients | null {
 		proteinPer100g: byId.get(NUTRIENT_IDS.protein) ?? 0,
 		carbsPer100g: byId.get(NUTRIENT_IDS.carbs) ?? 0,
 		fatPer100g: byId.get(NUTRIENT_IDS.fat) ?? 0,
+		fiberPer100g: byId.get(NUTRIENT_IDS.fiber) ?? 0,
 	};
 }
 
+/** One decimal, and never negative zero. */
+function round1(value: number): number {
+	return Math.round(value * 10) / 10 || 0;
+}
+
 /** Per-100g macros as a Macros block (for reporting a food's density). */
-export function nutrientsToMacros(n: FoodNutrients): Macros {
-	return round({
-		calories: n.caloriesPer100g,
-		protein: n.proteinPer100g,
-		carbs: n.carbsPer100g,
-		fat: n.fatPer100g,
-	});
+export function nutrientsToMacros(n: FoodNutrients): EntryMacros {
+	return scaleNutrients(n, 100);
 }
 
 /** Scale per-100g macros to the amount actually logged. */
-export function scaleNutrients(n: FoodNutrients, grams: number): Macros {
+export function scaleNutrients(n: FoodNutrients, grams: number): EntryMacros {
 	const factor = grams / 100;
-	return round({
-		calories: n.caloriesPer100g * factor,
-		protein: n.proteinPer100g * factor,
-		carbs: n.carbsPer100g * factor,
-		fat: n.fatPer100g * factor,
-	});
+	const carbs = n.carbsPer100g * factor;
+	const fiber = n.fiberPer100g * factor;
+	return {
+		calories: Math.round(n.caloriesPer100g * factor),
+		protein: round1(n.proteinPer100g * factor),
+		carbs: round1(carbs),
+		fat: round1(n.fatPer100g * factor),
+		fiber: round1(fiber),
+		netCarbs: round1(Math.max(0, carbs - fiber)),
+	};
 }
 
 /**
@@ -260,8 +279,10 @@ export function measureGramsFromFood(
 			? measures.find((m) => Number(m?.id) === Number(food.defaultMeasureId))
 			: undefined) ??
 		measures[0];
+	// Rounded: the stored value carries float noise (a 157 g cup reads back as
+	// 156.99337500000001), which is meaningless precision for a portion weight.
 	const grams = num(chosen?.value);
-	return grams > 0 ? grams : undefined;
+	return grams > 0 ? Math.round(grams * 100) / 100 : undefined;
 }
 
 /** Parse a get_diary response into a compact list of logged entries. */
@@ -302,7 +323,7 @@ export interface FoodResult {
 	/** Human label for the measure, e.g. "1 piece - 140g". */
 	measureName?: string;
 	/** Per-100g macros. Only set once food details have been resolved. */
-	per100g?: Macros;
+	per100g?: EntryMacros;
 }
 
 /** Parse a find_food response into a compact result list. */

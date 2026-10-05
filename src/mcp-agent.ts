@@ -165,16 +165,20 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 							protein_g: macros?.protein,
 							carbs_g: macros?.carbs,
 							fat_g: macros?.fat,
+							fiber_g: macros?.fiber,
+							net_carbs_g: macros?.netCarbs,
 						};
 					});
 
 					// Summing the per-item figures gives a cross-check against the totals
 					// Cronometer computed itself; a large gap means some foods did not resolve.
+					// Compared on NET carbs, because that is the basis Cronometer reports the
+					// day's carbs_g on — against total carbs the sum looks inflated by fiber.
 					const perItemTotal = detailed.reduce(
 						(acc, e) => ({
 							calories: acc.calories + (e.kcal ?? 0),
 							protein: acc.protein + (e.protein_g ?? 0),
-							carbs: acc.carbs + (e.carbs_g ?? 0),
+							carbs: acc.carbs + (e.net_carbs_g ?? 0),
 							fat: acc.fat + (e.fat_g ?? 0),
 						}),
 						{ calories: 0, protein: 0, carbs: 0, fat: 0 },
@@ -212,7 +216,9 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 											const grams = e.grams != null ? ` — ${e.grams} g` : "";
 											const macros =
 												e.kcal != null
-													? ` · ${e.kcal} kcal · P ${e.protein_g}g · C ${e.carbs_g}g · F ${e.fat_g}g`
+													? ` · ${e.kcal} kcal · P ${e.protein_g}g · C ${e.carbs_g}g · F ${e.fat_g}g${
+															e.fiber_g ? ` · fiber ${e.fiber_g}g` : ""
+														}`
 													: " · (nutrition unavailable)";
 											const sid =
 												e.serving_id != null
@@ -229,7 +235,7 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 						content: [
 							{
 								type: "text",
-								text: `Nutrition diary for ${d}\nDaily totals (from Cronometer): ${macroLine(totals)}\nSum of per-item values: ${macroLine(roundMacros(perItemTotal))}${
+								text: `Nutrition diary for ${d}\nDaily totals (from Cronometer): ${macroLine(totals)}\nSum of per-item values: ${macroLine(roundMacros(perItemTotal))}  (carbs compared as net carbs, Cronometer's basis)${
 									unresolved > 0
 										? `\nNote: ${unresolved} of ${detailed.length} entries could not be resolved, so the per-item sum is lower than the day's real total.`
 										: ""
@@ -576,6 +582,8 @@ export class MyMCP extends McpAgent<Env, AgentState, Props> {
 										protein_g_per_100g: r.per100g?.protein,
 										carbs_g_per_100g: r.per100g?.carbs,
 										fat_g_per_100g: r.per100g?.fat,
+										fiber_g_per_100g: r.per100g?.fiber,
+										net_carbs_g_per_100g: r.per100g?.netCarbs,
 									})),
 									null,
 									2,
